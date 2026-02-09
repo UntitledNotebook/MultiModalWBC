@@ -69,3 +69,15 @@ tests/
 
 # Docker history
 .isaac-lab-docker-history
+
+
+*.csv
+*.pkl
+*.zarr
+*.npz
+
+**/assets/
+artifacts/
+datasets/
+tmp/
+checkpoints/
