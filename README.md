@@ -35,6 +35,8 @@ The framework currently focuses on **Unitree G1**, but is designed to be extensi
 
 ### Demo
 
+See `docs/illustrations/demo.mp4`
+
 <p align="center">
   <video src="docs/illustrations/demo.mp4" controls width="640">
     Your browser does not support the video tag. You can download the video from
