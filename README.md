@@ -1,5 +1,16 @@
 # Multi-Modal Whole-Body Control
 
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-blue.svg)](./LICENSE)
+![Python 3.10](https://img.shields.io/badge/python-3.10-blue.svg)
+![OS Linux](https://img.shields.io/badge/OS-Linux-green.svg)
+![Isaac Sim 4.5](https://img.shields.io/badge/IsaacSim-4.5.0-ff6f00.svg)
+![Isaac Lab 2.1.1](https://img.shields.io/badge/IsaacLab-2.1.1-3b5cff.svg)
+![RSL--RL](https://img.shields.io/badge/RSL--RL-integrated-orange.svg)
+
+<p align="center">
+  <img src="docs/illustrations/mmwbc.png" alt="Multi-Modal Whole-Body Control" width="80%" />
+</p>
+
 **Multi-Modal Whole-Body Control** is a research-oriented framework for learning **whole-body control policies** for humanoid and general articulated robots from **heterogeneous motion signals**.  
 Built on **NVIDIA Isaac Sim / Isaac Lab** and **RSL-RL**, the framework targets **large-scale parallel simulation** and **multi-modal imitation learning**, with a focus on *robust motion tracking* and *cross-modal embodiment*.
 
@@ -7,8 +18,6 @@ The core philosophy of this repository is to treat **whole-body control as a mul
 a robot policy learns to coordinate its full-body dynamics by jointly conditioning on robot-centric states and external motion descriptors such as **human body pose (SMPL-X)** and **SE(3) keypoints**.
 
 The framework currently focuses on **Unitree G1**, but is designed to be extensible to other humanoid or whole-body platforms.
-
----
 
 ## Key Ideas
 
@@ -24,38 +33,20 @@ The framework currently focuses on **Unitree G1**, but is designed to be extensi
 - **Unified tracking & imitation**  
   Motion tracking, multi-motion training, and GAE-Mimic–style imitation are expressed within a single task framework.
 
-- **Data-driven curricula**  
-  Motion sampling ratios adapt automatically based on tracking performance.
+### Demo
 
----
+<p align="center">
+  <video src="docs/illustrations/demo.mp4" controls width="640">
+    Your browser does not support the video tag. You can download the video from
+    <a href="docs/illustrations/demo.mp4">docs/illustrations/demo.mp4</a>.
+  </video>
+</p>
 
-## Features
-
-- **Isaac Lab task definitions** for:
-  - single-motion tracking,
-  - multi-motion tracking,
-  - multi-modal imitation (GAE-Mimic style).
-
-- **Whole-body robot models**
-  - Full articulation and actuator configuration (Unitree G1).
-  - Per-joint-group stiffness, damping, and action scaling.
-
-- **Multi-modal motion datasets**
-  - NPZ-based motion clips with lazy loading.
-  - Optional extensions with SMPL-X and robot keypoints.
-
-- **High-performance dataloaders**
-  - Vectorized global indexing over concatenated motion sequences.
-  - Weighted sampling and curriculum support.
-  - Distributed sharding for multi-GPU training.
-
-- **RSL-RL integration**
-  - PPO-style training at scale.
-  - Logging, checkpointing, video recording, and resume support.
-
----
 
 ## Repository Structure
+
+<details>
+<summary><strong>Click to expand repository structure</strong></summary>
 
 ```
 
@@ -78,9 +69,14 @@ The framework currently focuses on **Unitree G1**, but is designed to be extensi
 
 ```
 
----
+</details>
+
+
 
 ## Tasks and Environments
+
+<details>
+<summary><strong>Click to expand tasks and environments</strong></summary>
 
 All environments are implemented using **Isaac Lab task abstractions**.
 
@@ -108,9 +104,14 @@ All environments are implemented using **Isaac Lab task abstractions**.
     - SE(3) keypoint trajectories
   - Designed for cross-modal imitation and embodiment transfer
 
----
+</details>
+
+
 
 ## Robot Model
+
+<details>
+<summary><strong>Click to expand robot model</strong></summary>
 
 ### Unitree G1
 
@@ -124,73 +125,8 @@ Includes:
 - Per-joint-group actuator stiffness and damping
 - Action scaling for stable RL control
 
----
-
-## Motion Datasets
-
-<details>
-<summary><strong>Click to expand dataset details</strong></summary>
-
-### Dataset Layout
-
-```
-
-datasets/
-└── extended_datasets/
-└── 100style_dataset/
-├── g1/
-│   ├── *.npz
-└── info.yaml
-
-````
-
-Each dataset provides:
-- Preprocessed motion clips in NPZ format
-- `info.yaml` describing splits and motion quality
-
----
-
-### Dataset APIs
-
-- **`Motion_Dataset`**
-  - Lazy loading of motion clips
-  - Robot joint and body trajectories with metadata
-
-- **`Unify_Motion_Dataset`**
-  - Extends with SMPL-X body pose and robot keypoints
-  - Flattens multi-modal data for RL observations
-
-- **`Motion_Dataloader` / `Unify_Motion_Dataloader`**
-  - Concatenated tensors with efficient global indexing
-  - Weighted sampling and distributed sharding
-
 </details>
 
----
-
-## Environment Setup
-
-For full instructions, see [`docs/env_setup.md`](docs/env_setup.md).
-
-### Quick Summary
-
-<details>
-<summary><strong>Click to expand environment setup</strong></summary>
-
-```bash
-conda create -n env_mimic python=3.10
-conda activate env_mimic
-
-pip install torch==2.7.0 torchvision==0.22.0 \
-  --index-url https://download.pytorch.org/whl/cu128
-
-pip install 'isaacsim[all,extscache]==4.5.0' \
-  --extra-index-url https://pypi.nvidia.com
-````
-
-</details>
-
----
 
 ## Installation
 
@@ -214,9 +150,8 @@ pip install -e .
 
 </details>
 
----
 
-## Dataset Download
+### Dataset Download
 
 <details>
 <summary><strong>Click to expand dataset download</strong></summary>
@@ -229,8 +164,6 @@ Unzip under the `datasets/` directory.
 
 </details>
 
----
-
 ## Quick Start
 
 <details>
@@ -241,14 +174,6 @@ Unzip under the `datasets/` directory.
 ```bash
 python scripts/tools/list_envs.py
 ```
-
-Example task ID:
-
-```
-MultiTracking-Flat-G1-v0
-```
-
----
 
 ### Train a Policy
 
@@ -267,22 +192,6 @@ Common options:
 * `--distributed` (multi-GPU)
 
 </details>
-
----
-
-## Typical Workflow
-
-<details>
-<summary><strong>Click to expand workflow</strong></summary>
-
-1. Prepare or extend motion datasets (`scripts/data/`)
-2. Select task type and modality
-3. Train whole-body policies with RSL-RL
-4. Evaluate stability, contacts, and motion fidelity
-
-</details>
-
----
 
 ## License
 
