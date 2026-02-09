@@ -1,6 +1,7 @@
 import gymnasium as gym
 
 from . import agents, flat_env_cfg
+from .agents import rsl_rl_ppo_cfg
 
 ##
 # Register Gym environments.
@@ -12,7 +13,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": flat_env_cfg.G1FlatEnvCfg,
-        "rsl_rl_cfg_entry_point": agents.rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
+        "rsl_rl_cfg_entry_point": rsl_rl_ppo_cfg.G1FlatPPORunnerCfg,
     },
 )
 
@@ -23,7 +24,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": flat_env_cfg.MultiTracking_G1FlatEnvCfg,
-        "rsl_rl_cfg_entry_point": agents.rsl_rl_ppo_cfg.MultiTracking_G1FlatPPORunnerCfg,
+        "rsl_rl_cfg_entry_point": rsl_rl_ppo_cfg.MultiTracking_G1FlatPPORunnerCfg,
     },
 )
 
@@ -33,7 +34,7 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": flat_env_cfg.GAEMimic_G1FlatEnvCfg,
-        "rsl_rl_cfg_entry_point": agents.rsl_rl_ppo_cfg.GAEMimic_G1FlatPPORunnerCfg,
+        "rsl_rl_cfg_entry_point": rsl_rl_ppo_cfg.GAEMimic_G1FlatPPORunnerCfg,
     },
 )
 
@@ -43,6 +44,6 @@ gym.register(
     disable_env_checker=True,
     kwargs={
         "env_cfg_entry_point": flat_env_cfg.GAEMimic_G1FlatEnvCfg,
-        "rsl_rl_cfg_entry_point": agents.rsl_rl_ppo_cfg.GAEMimic_Large_G1FlatPPORunnerCfg,
+        "rsl_rl_cfg_entry_point": rsl_rl_ppo_cfg.GAEMimic_Large_G1FlatPPORunnerCfg,
     },
 )

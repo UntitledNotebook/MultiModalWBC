@@ -81,3 +81,5 @@ artifacts/
 datasets/
 tmp/
 checkpoints/
+third_party/IsaacLab
+**/__pycache__/

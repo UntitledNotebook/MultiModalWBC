@@ -86,9 +86,12 @@ class GAEMimic_G1FlatEnvCfg(GAEMimic_TrackingEnvCfg):
         self.commands.motion.robot_name = "g1"
         self.commands.motion.dataset_dirs = [
             os.path.join(EXTEMDED_DATASETS_DIR, "lafan1_dataset"),
-            os.path.join(EXTEMDED_DATASETS_DIR, "100style_dataset"),
-            ]
-        self.commands.motion.splits = ["train", "train", ]
+            # os.path.join(EXTEMDED_DATASETS_DIR, "100style_dataset"),
+        ]
+        self.commands.motion.splits = [
+            "train", 
+            # "train", 
+        ]
         
         self.commands.motion.adaptive_uniform_ratio = 0.0
         self.commands.motion.adaptive_cap = 20
