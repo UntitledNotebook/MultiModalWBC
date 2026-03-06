@@ -11,7 +11,7 @@ from isaaclab.sensors import FrameTransformerCfg, ContactSensorCfg
 from isaaclab.sensors.frame_transformer import OffsetCfg
 
 from .constants import G1_CAT_CFG, SITE_BODY_OFFSETS
-
+import isaaclab.sim as sim_utils
 
 # ==============================================================================
 # Nested sub-configs (mirrors config_dict.create(...) in env_cat.py)
@@ -110,7 +110,7 @@ class CommandCfg:
 @configclass
 class PfCfg:
     """Potential-field (navigation field) configuration."""
-    path: str = "data/assets/TypiObs/empty"
+    path: str = "data/TypiObs/bar0"
     dx: float = 0.04
     # World-frame origin of the loaded field grid (x, y, z)
     origin: tuple[float, float, float] = (-0.5, -1.0, 0.0)
@@ -124,11 +124,23 @@ class PfCfg:
 class G1CatSceneCfg(InteractiveSceneCfg):
     """Scene with G1 robot, ground plane, and sensors."""
 
-    num_envs: int = 4096
-    env_spacing: float = 2.5
+    # num_envs: int = 4096
+    num_envs: int = 128
+    env_spacing: float = 6.0
 
     # Robot
     robot: ArticulationCfg = G1_CAT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    # Obstacle mesh from pf_config
+    obstacle = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Obstacle",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path="data/TypiObs/bar0/obs.usd"
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=(-0.5, -1.0, 0.0),
+        )
+    )
 
     # FrameTransformer: track body sites using offsets from SITE_BODY_OFFSETS
     frame_transformer = FrameTransformerCfg(
@@ -257,7 +269,7 @@ class G1CatEnvCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(dt=0.002, render_interval=10)
 
     # Scene
-    scene: G1CatSceneCfg = G1CatSceneCfg(num_envs=4096, env_spacing=2.5)
+    scene: G1CatSceneCfg = G1CatSceneCfg(num_envs=4096, env_spacing=6.0)
 
     # Timing
     decimation: int = 10                  # ctrl_dt / sim_dt = 0.02 / 0.002

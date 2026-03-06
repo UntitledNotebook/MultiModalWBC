@@ -32,6 +32,7 @@ from .constants import (
     ACTION_JOINT_NAMES, OBS_JOINT_NAMES, ALL_JOINT_NAMES,
     KPS, KDS, TORQUE_LIMIT, NUM_FIELD_SITES, ALL_FRAME_NAMES,
 )
+from . import rewards
 
 @dataclass
 class CommandState:
@@ -865,6 +866,7 @@ class G1CatEnv(DirectRLEnv):
         return {"policy": state, "critic": privileged_state}
 
     def _get_rewards(self) -> torch.Tensor:
+<<<<<<< HEAD
         move_flag = self.cmd_state.command[:, 0]  # (N,)
         cmd_vel = self.cmd_state.command[:, 1:4].clone()  # (N, 3) [x, y, yaw]
 
@@ -964,6 +966,195 @@ class G1CatEnv(DirectRLEnv):
             self.extras["log"][f"Reward/{key}"] = value.mean()
 
         return reward
+=======
+        total_reward = torch.zeros(self.num_envs, device=self.device)
+        if "log" not in self.extras:
+            self.extras["log"] = {}
+
+        # Pre-compute some shared tensors
+        move_flag = self.cmd_state.command[:, 0]
+        cmd_vel_w = self.cmd_state.command[:, 1:4] # (N, 3), [vx, vy, vyaw]
+        nT = self.navi_state.navi2world_rot.transpose(-1, -2) # (N, 3, 3)
+
+        scales = self.cfg.reward_config.scales
+        
+        # 1. Orientation
+        if scales.tracking_orientation != 0:
+            idle_mask = (self.body_state.head_pos[:, 2] > (self.cfg.torso_height[1] + 0.1)).float()
+            pelvis_rpy = self.navi_state.navi_pelvis_rpy
+            torso_rpy = self.navi_state.navi_torso_rpy
+            reward_ori = rewards.reward_orientation(pelvis_rpy, torso_rpy, idle_mask)
+            total_reward += scales.tracking_orientation * reward_ori
+            self.extras["log"]["reward_orientation"] = (scales.tracking_orientation * reward_ori).mean()
+
+        # 2. Tracking root field
+        if scales.tracking_root_field != 0:
+            reward_tr_f = rewards.reward_tracking_root_field(cmd_vel_w, self.vel_state.global_lin_vel)
+            total_reward += scales.tracking_root_field * reward_tr_f
+            self.extras["log"]["reward_tracking_root_field"] = (scales.tracking_root_field * reward_tr_f).mean()
+
+        # 3. Body motion
+        if scales.body_motion != 0:
+            cost_bm = rewards.cost_body_motion(self.vel_state.global_lin_vel, self.navi_state.navi_torso_ang_vel, cmd_vel_w)
+            total_reward += scales.body_motion * cost_bm
+            self.extras["log"]["cost_body_motion"] = (scales.body_motion * cost_bm).mean()
+
+        # 4. Body rotation
+        if scales.body_rotation != 0:
+            if not hasattr(self, "_legs_body_ids"):
+                self._legs_body_ids, _ = self.robot.find_bodies([
+                    ".*hip_pitch_link", ".*hip_roll_link", ".*hip_yaw_link",
+                    ".*knee_link", ".*ankle_pitch_link", ".*ankle_roll_link"
+                ])
+                if len(self._legs_body_ids) == 0:
+                    # Fallback to feet frames if not found
+                    self._legs_body_ids = [self._pelv_body_idx] # dummy, will use frame transformer
+            
+            if len(self._legs_body_ids) > 1:
+                legs_quat_w = self.robot.data.body_quat_w[:, self._legs_body_ids, :] # (N, L, 4)
+                legs_mat_w = matrix_from_quat(legs_quat_w.view(-1, 4)).view(self.num_envs, len(self._legs_body_ids), 3, 3)
+            else:
+                feet_quat_w = self.frame_transformer.data.target_quat_w[:, self._feet_frame_idx, :] # (N, 2, 4)
+                legs_mat_w = matrix_from_quat(feet_quat_w.view(-1, 4)).view(self.num_envs, 2, 3, 3)
+
+            nT_unsq = nT.unsqueeze(1) # (N, 1, 3, 3)
+            legs_navi_rot = torch.matmul(nT_unsq, legs_mat_w)
+            cmd_yaw_vel = cmd_vel_w[:, 2]
+            cmd_yaw_max = self.cfg.command_config.ang_vel_yaw[1] if hasattr(self.cfg.command_config, "ang_vel_yaw") else 0.5
+            reward_br = rewards.reward_body_rotation(legs_navi_rot, cmd_yaw_vel, cmd_yaw_max)
+            total_reward += scales.body_rotation * reward_br
+            self.extras["log"]["reward_body_rotation"] = (scales.body_rotation * reward_br).mean()
+
+        # 5. Foot Contact
+        if scales.foot_contact != 0:
+            net_forces = self._foot_ground_contact.data.net_forces_w
+            feet_contact = (torch.norm(net_forces, dim=-1) > self._foot_ground_contact.cfg.force_threshold).float()
+            cost_fc = rewards.cost_foot_contact(feet_contact, self.gait_state.gait_mask, move_flag)
+            total_reward += scales.foot_contact * cost_fc
+            self.extras["log"]["cost_foot_contact"] = (scales.foot_contact * cost_fc).mean()
+
+        # 6. Foot Clearance
+        if scales.foot_clearance != 0:
+            feet_z = self.body_state.feet_pos[:, :, 2]
+            cost_fclear = rewards.cost_foot_clearance(feet_z, self.gait_state.foot_height, self.gait_state.gait_mask, move_flag, self.cfg.reward_config.foot_height_stance)
+            total_reward += scales.foot_clearance * cost_fclear
+            self.extras["log"]["cost_foot_clearance"] = (scales.foot_clearance * cost_fclear).mean()
+
+        # 7. Foot Slip
+        if scales.foot_slip != 0:
+            feet_vel_w = self.body_state.feet_vel
+            cost_fslip = rewards.cost_foot_slip(feet_vel_w, self.gait_state.gait_mask)
+            total_reward += scales.foot_slip * cost_fslip
+            self.extras["log"]["cost_foot_slip"] = (scales.foot_slip * cost_fslip).mean()
+
+        # 8. Foot Balance
+        if scales.foot_balance != 0:
+            origin = self.navi_state.navi2world_pose[:, :3, 3] # (N, 3)
+            com_world = self.robot.data.root_pos_w # (N, 3)
+            com_pos_rel = com_world - origin
+            com_pos_navi = torch.bmm(nT, com_pos_rel.unsqueeze(-1)).squeeze(-1) # (N, 3)
+            feet_pos_rel = self.body_state.feet_pos - origin.unsqueeze(1) # (N, 2, 3)
+            nT_unsq = nT.unsqueeze(1)
+            feet_pos_navi = torch.matmul(nT_unsq, feet_pos_rel.unsqueeze(-1)).squeeze(-1) # (N, 2, 3)
+            cost_fb = rewards.cost_foot_balance(com_pos_navi, feet_pos_navi, move_flag)
+            total_reward += scales.foot_balance * cost_fb
+            self.extras["log"]["cost_foot_balance"] = (scales.foot_balance * cost_fb).mean()
+
+        # 9. Foot Far
+        if scales.foot_far != 0:
+            cost_ff = rewards.cost_foot_far(self.body_state.feet_pos)
+            total_reward += scales.foot_far * cost_ff
+            self.extras["log"]["cost_foot_far"] = (scales.foot_far * cost_ff).mean()
+
+        # 10. Straight knee
+        if scales.straight_knee != 0:
+            lkp_idx = self.robot.find_joints("left_knee_joint")[0][0]
+            rkp_idx = self.robot.find_joints("right_knee_joint")[0][0]
+            knee_joint_pos = self.robot.data.joint_pos[:, [lkp_idx, rkp_idx]]
+            cost_sk = rewards.cost_straight_knee(knee_joint_pos)
+            total_reward += scales.straight_knee * cost_sk
+            self.extras["log"]["cost_straight_knee"] = (scales.straight_knee * cost_sk).mean()
+
+        # 11. Smoothness joint
+        if scales.smoothness_joint != 0:
+            cost_sj = rewards.cost_smoothness_joint(self.robot.data.joint_vel[:, self._all_joint_ids], self.vel_state.last_joint_vel, self._ctrl_dt)
+            total_reward += scales.smoothness_joint * cost_sj
+            self.extras["log"]["cost_smoothness_joint"] = (scales.smoothness_joint * cost_sj).mean()
+
+        # 12. Smoothness action
+        if scales.smoothness_action != 0:
+            cost_sa = rewards.cost_smoothness_action(self.actions, self.action_state.last_act, self.action_state.last_last_act)
+            total_reward += scales.smoothness_action * cost_sa
+            self.extras["log"]["cost_smoothness_action"] = (scales.smoothness_action * cost_sa).mean()
+
+        # 13. Joint limits
+        if scales.joint_limits != 0:
+            cost_j_lim = rewards.cost_joint_pos_limits(self.robot.data.joint_pos[:, self._all_joint_ids], self._soft_lowers, self._soft_uppers)
+            total_reward += scales.joint_limits * cost_j_lim
+            self.extras["log"]["cost_joint_limits"] = (scales.joint_limits * cost_j_lim).mean()
+
+        # 14. Joint torque
+        if scales.joint_torque != 0:
+            if hasattr(self.robot.data, "applied_torque"):
+                cost_tq = rewards.cost_torque(self.robot.data.applied_torque[:, self._all_joint_ids])
+                total_reward += scales.joint_torque * cost_tq
+                self.extras["log"]["cost_joint_torque"] = (scales.joint_torque * cost_tq).mean()
+
+        # 15. Field terms
+        gf_cur = self.field_state.gf
+        df_cur = self.field_state.df
+
+        # crossed flag logic
+        move_off = move_flag < 0.5
+        x_offset = self.scene.env_origins[:, 0]
+        
+        crossed_head = move_off | ((self.body_state.head_pos[:, 0] - x_offset) > 1.5)
+        crossed_feet = move_off.unsqueeze(-1) | (self.gait_state.gait_mask == 1.0) | ((self.body_state.feet_pos[:, :, 0] - x_offset.unsqueeze(-1)) > 1.5)
+        crossed_hands = move_off.unsqueeze(-1) | ((self.body_state.hands_pos[:, :, 0] - x_offset.unsqueeze(-1)) > 1.5)
+
+        if scales.headgf != 0:
+            head_lin_vel = self.body_state.head_vel.unsqueeze(1)
+            reward_headgf = rewards.reward_guidance_field_alignment(gf_cur[:, 0:1, :], head_lin_vel, df_cur[:, 0:1, :], crossed_head.unsqueeze(-1), tau=0.5)
+            total_reward += scales.headgf * reward_headgf
+            self.extras["log"]["reward_headgf"] = (scales.headgf * reward_headgf).mean()
+
+        if scales.headdf != 0:
+            total_reward += scales.headdf * rewards.cost_sdf_penalty(df_cur[:, 0:1, :])
+            self.extras["log"]["cost_headdf"] = (scales.headdf * rewards.cost_sdf_penalty(df_cur[:, 0:1, :])).mean()
+
+        if scales.handsgf != 0:
+            hands_lin_vel = self.body_state.hands_vel
+            reward_handsgf = rewards.reward_guidance_field_alignment(gf_cur[:, 5:7, :], hands_lin_vel, df_cur[:, 5:7, :], crossed_hands, tau=0.5)
+            total_reward += scales.handsgf * reward_handsgf
+            self.extras["log"]["reward_handsgf"] = (scales.handsgf * reward_handsgf).mean()
+
+        if scales.handsdf != 0:
+            total_reward += scales.handsdf * rewards.cost_sdf_penalty(df_cur[:, 5:7, :])
+            self.extras["log"]["cost_handsdf"] = (scales.handsdf * rewards.cost_sdf_penalty(df_cur[:, 5:7, :])).mean()
+
+        if scales.feetgf != 0:
+            feet_lin_vel = self.body_state.feet_vel
+            reward_feetgf = rewards.reward_guidance_field_alignment(gf_cur[:, 3:5, :], feet_lin_vel, df_cur[:, 3:5, :], crossed_feet, tau=0.3)
+            total_reward += scales.feetgf * reward_feetgf
+            self.extras["log"]["reward_feetgf"] = (scales.feetgf * reward_feetgf).mean()
+
+        if scales.feetdf != 0:
+            total_reward += scales.feetdf * rewards.cost_sdf_penalty(df_cur[:, 3:5, :])
+            self.extras["log"]["cost_feetdf"] = (scales.feetdf * rewards.cost_sdf_penalty(df_cur[:, 3:5, :])).mean()
+
+        if scales.kneesdf != 0:
+            total_reward += scales.kneesdf * rewards.cost_sdf_penalty(df_cur[:, 7:9, :])
+            self.extras["log"]["cost_kneesdf"] = (scales.kneesdf * rewards.cost_sdf_penalty(df_cur[:, 7:9, :])).mean()
+
+        if scales.shldsdf != 0:
+            total_reward += scales.shldsdf * rewards.cost_sdf_penalty(df_cur[:, 9:11, :])
+            self.extras["log"]["cost_shldsdf"] = (scales.shldsdf * rewards.cost_sdf_penalty(df_cur[:, 9:11, :])).mean()
+
+        # replace NaN with 0 like in env_cat.py
+        total_reward = torch.nan_to_num(total_reward, nan=0.0)
+
+        return total_reward
+>>>>>>> origin/wip/training-bug
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._post_physics_step()

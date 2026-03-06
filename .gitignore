@@ -83,3 +83,6 @@ tmp/
 checkpoints/
 third_party/IsaacLab
 **/__pycache__/
+
+data/
+**/unitree_model/
