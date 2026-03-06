@@ -190,6 +190,16 @@ class G1CatSceneCfg(InteractiveSceneCfg):
                 prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['right_shoulder'][0]}",
                 offset=OffsetCfg(pos=SITE_BODY_OFFSETS['right_shoulder'][1]),
             ),
+            FrameTransformerCfg.FrameCfg(
+                name="left_ankle_roll",
+                prim_path=f"{{ENV_REGEX_NS}}/Robot/left_ankle_roll_link",
+                offset=OffsetCfg(pos=(0.0, 0.0, 0.0)),
+            ),
+            FrameTransformerCfg.FrameCfg(
+                name="right_ankle_roll",
+                prim_path=f"{{ENV_REGEX_NS}}/Robot/right_ankle_roll_link",
+                offset=OffsetCfg(pos=(0.0, 0.0, 0.0)),
+            ),
         ],
     )
 

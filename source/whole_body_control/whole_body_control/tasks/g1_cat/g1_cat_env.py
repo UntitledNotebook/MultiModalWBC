@@ -7,14 +7,14 @@ from typing import Sequence, TYPE_CHECKING
 from isaaclab.sensors import ContactSensor
 
 if TYPE_CHECKING:
-    from isaaclab.sensors import FrameTransformer
+    from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 
 import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
-from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+from isaaclab.sensors import FrameTransformer
 from isaaclab.utils.math import (
     euler_xyz_from_quat,
     matrix_from_quat,
@@ -30,7 +30,7 @@ from .g1_cat_env_cfg import G1CatEnvCfg
 from .utils import FieldSampler
 from .constants import (
     ACTION_JOINT_NAMES, OBS_JOINT_NAMES, ALL_JOINT_NAMES,
-    KPS, KDS, TORQUE_LIMIT, NUM_FIELD_SITES,
+    KPS, KDS, TORQUE_LIMIT, NUM_FIELD_SITES, ALL_FRAME_NAMES,
 )
 
 @dataclass
@@ -143,9 +143,7 @@ class FieldState:
     bf_delay: torch.Tensor  # (num_envs, 11, 3)
     df_delay: torch.Tensor  # (num_envs, 11, 1)
 
-    # ------------------------------------------------------------------
     # Named properties — current
-    # ------------------------------------------------------------------
 
     @property
     def headgf(self) -> torch.Tensor: return self.gf[:, 0:1]   # (N, 1, 3)
@@ -196,9 +194,7 @@ class FieldState:
     @property
     def shldsdf(self) -> torch.Tensor: return self.df[:, 9:11]
 
-    # ------------------------------------------------------------------
     # Named properties — delayed
-    # ------------------------------------------------------------------
 
     @property
     def headgf_delay(self) -> torch.Tensor: return self.gf_delay[:, 0:1]
@@ -274,93 +270,83 @@ class G1CatEnv(DirectRLEnv):
     def __init__(self, cfg: G1CatEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode=render_mode, **kwargs)
 
-        # ------------------------------------------------------------------ joints
+        # joints
         self._action_joint_ids, _ = self.robot.find_joints(ACTION_JOINT_NAMES)
         self._obs_joint_ids, _ = self.robot.find_joints(OBS_JOINT_NAMES)
-        self._all_joint_ids, _ = self.robot.find_joints(ALL_JOINT_NAMES)
+        all_joint_ids, _ = self.robot.find_joints(ALL_JOINT_NAMES)
 
-        # ------------------------------------------------------------------ PD
-        self._kps = torch.tensor(KPS, dtype=torch.float32, device=self.device)           # (29,)
-        self._kds = torch.tensor(KDS, dtype=torch.float32, device=self.device)           # (29,)
-        self._torque_limit = torch.tensor(TORQUE_LIMIT, dtype=torch.float32, device=self.device)  # (29,)
 
-        # ------------------------------------------------------------------ potential fields
+        # Knee joint indices for straight_knee reward
+        knee_joint_names = ["left_knee_joint", "right_knee_joint"]
+        self._knee_joint_ids, _ = self.robot.find_joints(knee_joint_names)
+
+        # PD — KPS/KDS/TORQUE_LIMIT are defined in ALL_JOINT_NAMES order; reorder to
+        # robot's native joint order so they can be broadcast directly against
+        # robot.data.joint_pos / joint_vel (which are always in native order).
+        _kps_allorder = torch.tensor(KPS, dtype=torch.float32, device=self.device)
+        _kds_allorder = torch.tensor(KDS, dtype=torch.float32, device=self.device)
+        _torque_limit_allorder = torch.tensor(TORQUE_LIMIT, dtype=torch.float32, device=self.device)
+        _all_joint_ids_t = torch.tensor(all_joint_ids, device=self.device)
+        self._kps = torch.zeros(29, dtype=torch.float32, device=self.device)
+        self._kds = torch.zeros(29, dtype=torch.float32, device=self.device)
+        self._torque_limit = torch.zeros(29, dtype=torch.float32, device=self.device)
+        self._kps[_all_joint_ids_t] = _kps_allorder            # (29,) robot-native order
+        self._kds[_all_joint_ids_t] = _kds_allorder            # (29,) robot-native order
+        self._torque_limit[_all_joint_ids_t] = _torque_limit_allorder  # (29,) robot-native order
+
+        # potential fields
         self.field_sampler = FieldSampler(
             path=cfg.pf_config.path,
             origin=cfg.pf_config.origin,
             spacing=cfg.pf_config.dx,
             device=self.device,
         )
-        self._ctrl_dt = cfg.decimation * cfg.sim.dt  # 0.02 s
 
-        # ------------------------------------------------------------------ default state
-        # default_joint_pos shape: (num_envs, 29) — take [0] if broadcast needed
+        # default state
         self._default_joint_pos = self.robot.data.default_joint_pos[0].clone()  # (29,)
 
-        # ------------------------------------------------------------------ soft joint limits
-        # Shape: (num_envs, num_joints, 2) -> take [0] since all envs have same limits
+        # soft joint limits
         self._soft_lowers = self.robot.data.soft_joint_pos_limits[0, :, 0]  # (29,)
         self._soft_uppers = self.robot.data.soft_joint_pos_limits[0, :, 1]  # (29,)
 
-        # ------------------------------------------------------------------ frame transformer
+        # frame transformer
         self.frame_transformer: FrameTransformer = self.scene.sensors["frame_transformer"]
-        # Resolve indices of each site group within target_frame_names
-        head_idx,  _ = self.frame_transformer.find_bodies("head")
-        pelv_idx,  _ = self.frame_transformer.find_bodies("imu_in_pelvis")
-        tors_idx,  _ = self.frame_transformer.find_bodies("imu_in_torso")
-        feet_idx,  _ = self.frame_transformer.find_bodies(["left_foot", "right_foot"], preserve_order=True)
-        hands_idx, _ = self.frame_transformer.find_bodies(["left_palm", "right_palm"], preserve_order=True)
-        knees_idx, _ = self.frame_transformer.find_bodies(["left_knee", "right_knee"], preserve_order=True)
-        shlds_idx, _ = self.frame_transformer.find_bodies(["left_shoulder", "right_shoulder"], preserve_order=True)
+        # Resolve all site indices in ALL_FRAME_NAMES order with a single find_bodies call
+        all_site_ids, _ = self.frame_transformer.find_bodies(ALL_FRAME_NAMES, preserve_order=True)
+        ankles_idx, _ = self.frame_transformer.find_bodies(["left_ankle_roll", "right_ankle_roll"], preserve_order=True)
 
-        # Convenience per-group indices (used outside _reset_idx too)
-        self._head_frame_idx  = head_idx[0]
-        self._pelv_frame_idx  = pelv_idx[0]
-        self._tors_frame_idx  = tors_idx[0]
-        self._feet_frame_idx  = feet_idx   # [left, right]
-        self._hands_frame_idx = hands_idx  # [left, right]
-        self._knees_frame_idx = knees_idx  # [left, right]
-        self._shlds_frame_idx = shlds_idx  # [left, right]
-
-        # Ordered index tensor for gathering all 11 sites in all_poses layout:
-        # [head, pelv, tors, left_foot, right_foot, left_palm, right_palm,
-        #  left_knee, right_knee, left_shoulder, right_shoulder]
-        self._all_site_idx = torch.tensor(
-            [self._head_frame_idx,
-             self._pelv_frame_idx,
-             self._tors_frame_idx,
-             *self._feet_frame_idx,
-             *self._hands_frame_idx,
-             *self._knees_frame_idx,
-             *self._shlds_frame_idx],
+        self._leg_body_frame_idx = torch.tensor(
+            [all_site_ids[7], ankles_idx[0], all_site_ids[8], ankles_idx[1]],
             dtype=torch.int32, device=self.device,
-        )  # (11,)
+        )  # (4,) [left_knee, left_ankle_roll, right_knee, right_ankle_roll]
+        self._all_site_idx = torch.tensor(all_site_ids, dtype=torch.int32, device=self.device)  # (11,)
+        self._pelv_frame_idx = all_site_ids[1]
+        self._tors_frame_idx = all_site_ids[2]
 
-        # ------------------------------------------------------------------ robot body indices (for body-frame velocities)
-        # Used in _post_physics_step to look up per-body velocities from robot.data.body_*_vel_w.
+        # robot body indices (for body-frame velocities)
         pelv_body_idx, _ = self.robot.find_bodies("pelvis")
         tors_body_idx, _ = self.robot.find_bodies("torso_link")
         self._pelv_body_idx = pelv_body_idx[0]   # scalar: index of pelvis in body list
         self._tors_body_idx = tors_body_idx[0]   # scalar: index of torso_link in body list
 
-        # ------------------------------------------------------------------ contact sensors
-        # foot_ground_contact tracks ankle_roll_link vs ground (used by rewards/gait and obs)
-        # left/right_foot_self_contact detect cross-limb collisions for termination
+        # contact sensors
         self._foot_ground_contact: ContactSensor = self.scene.sensors["foot_ground_contact"]
         self._left_foot_contact:   ContactSensor = self.scene.sensors["left_foot_self_contact"]
         self._right_foot_contact:  ContactSensor = self.scene.sensors["right_foot_self_contact"]
 
-        # ------------------------------------------------------------------ gait constants
+        # gait constants
         self._init_phase_l  = torch.tensor((0.0, math.pi), dtype=torch.float32, device=self.device)  # (2,)
         self._init_phase_r  = torch.tensor((math.pi, 0.0), dtype=torch.float32, device=self.device)  # (2,)
         self._gait_bound    = cfg.gait_config.gait_bound
         self._stance_phase  = torch.tensor((0.0, 0.0), dtype=torch.float32, device=self.device)      # (2,)
         self._stop_cmd = torch.zeros(4, dtype=torch.float32, device=self.device)
 
-        # ------------------------------------------------------------------ per-env state buffers
+        # per-env state buffers
         self._init_state_buffers()
 
-    # ------------------------------------------------------------------
+        if "log" not in self.extras:
+            self.extras["log"] = dict()
+
     def _init_state_buffers(self):
         """Allocate zero-initialised per-env state tensors."""
         N = self.num_envs
@@ -433,7 +419,6 @@ class G1CatEnv(DirectRLEnv):
             odom_delay=torch.zeros(N, 7, device=d),
         )
 
-    # ------------------------------------------------------------------
     def _setup_scene(self):
         super()._setup_scene()
         self.robot = Articulation(self.cfg.scene.robot)
@@ -450,7 +435,6 @@ class G1CatEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-    # ------------------------------------------------------------------
     def _reset_idx(self, env_ids: Sequence[int]):
         """Reset selected environments, faithfully following env_cat.py reset().
 
@@ -467,7 +451,7 @@ class G1CatEnv(DirectRLEnv):
         n = len(env_ids)
         d = self.device
 
-        # ------------------------------------------------------------------ root state
+        # root state
         # default_root_state: (num_envs, 13)  [pos(3) quat(4) lin_vel(3) ang_vel(3)]
         root_state = self.robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
@@ -491,7 +475,7 @@ class G1CatEnv(DirectRLEnv):
 
         self.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
 
-        # ------------------------------------------------------------------ joint state
+        # joint state
         # env_cat.py: qpos[7:] *= U(0.5, 1.5), clamp to soft limits
         default_jpos = self._default_joint_pos.unsqueeze(0).expand(n, -1).clone()  # (n, 29)
         rand_scale = torch.empty(n, 29, device=d).uniform_(0.5, 1.5)
@@ -502,11 +486,10 @@ class G1CatEnv(DirectRLEnv):
         joint_vel = torch.zeros_like(joint_pos)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
-        # ------------------------------------------------------------------ refresh sensors
-        # Propagate written state to FrameTransformer so site positions are current
+        # refresh sensors
         self.scene.update(dt=0.0)
 
-        # ------------------------------------------------------------------ body positions  (env_cat.py data.site_xpos[...])
+        # body positions  (env_cat.py data.site_xpos[...])
         # target_pos_w: (num_envs, num_target_frames, 3)
         all_pos_w = self.frame_transformer.data.target_pos_w[
             env_ids
@@ -519,30 +502,30 @@ class G1CatEnv(DirectRLEnv):
         pelv_pos = pelv_pos.squeeze(1)   # (n, 1, 3) -> (n, 3)
         tors_pos = tors_pos.squeeze(1)   # (n, 1, 3) -> (n, 3)
 
-        # ------------------------------------------------------------------ field sampling  (env_cat.py sample_field)
+        # field sampling  (env_cat.py sample_field)
         gf = self.field_sampler.sample_gf(all_pos_w)  # (n, 11, 3)
         bf = self.field_sampler.sample_bf(all_pos_w)  # (n, 11, 3)
         df = self.field_sampler.sample_sdf(all_pos_w) # (n, 11, 1)
 
-        # ------------------------------------------------------------------ command  (env_cat.py compute_cmd_from_rtf)
+        # command  (env_cat.py compute_cmd_from_rtf)
         pelvgf   = gf[:, 1]                          # (n, 3)
         cgf_init = gf[:, [0, 3, 4, 5, 6]]           # (n, 5, 3)
         cbf_init = bf[:, [0, 3, 4, 5, 6]]           # (n, 5, 3)
         command  = self.compute_cmd_from_rtf(pelvgf, cgf_init, cbf_init)  # (n, 4)
 
-        # ------------------------------------------------------------------ push interval  (env_cat.py push_config)
+        # push interval  (env_cat.py push_config)
         push_interval_s = torch.empty(n, device=d).uniform_(
             self.cfg.push_config.interval_range[0],
             self.cfg.push_config.interval_range[1],
         )
-        push_interval_steps = (push_interval_s / self._ctrl_dt).round().to(torch.int32)
+        push_interval_steps = (push_interval_s / self.step_dt).round().to(torch.int32)
 
-        # ------------------------------------------------------------------ gait  (env_cat.py gait_config)
+        # gait  (env_cat.py gait_config)
         gait_freq = torch.empty(n, device=d).uniform_(
             self.cfg.gait_config.freq_range[0],
             self.cfg.gait_config.freq_range[1],
         )
-        phase_dt = 2.0 * math.pi * self._ctrl_dt * gait_freq  # (n,)
+        phase_dt = 2.0 * math.pi * self.step_dt * gait_freq  # (n,)
 
         cond     = torch.rand(n, device=d) > 0.5              # (n,) bool
         phase_l  = self._init_phase_l.unsqueeze(0).expand(n, -1)
@@ -554,7 +537,7 @@ class G1CatEnv(DirectRLEnv):
             self.cfg.gait_config.foot_height_range[1],
         )
 
-        # ------------------------------------------------------------------ domain randomisation  (env_cat.py dm_rand_config)
+        # domain randomisation  (env_cat.py dm_rand_config)
         kp_scale = torch.empty(n, device=d).uniform_(*self.cfg.dm_rand_config.kp_range)
         kd_scale = torch.empty(n, device=d).uniform_(*self.cfg.dm_rand_config.kd_range)
 
@@ -565,13 +548,14 @@ class G1CatEnv(DirectRLEnv):
             * self._torque_limit.unsqueeze(0)
         )  # (n, 29)
 
-        if not self.cfg.dm_rand_config.enable_pd:
-            kp_scale.fill_(1.0)
-            kd_scale.fill_(1.0)
-        if not self.cfg.dm_rand_config.enable_rfi:
-            rfi_lim_scale.zero_()
+        enable_pd = torch.tensor(self.cfg.dm_rand_config.enable_pd, device=d)
+        kp_scale = torch.where(enable_pd, kp_scale, torch.ones_like(kp_scale))
+        kd_scale = torch.where(enable_pd, kd_scale, torch.ones_like(kd_scale))
 
-        # ------------------------------------------------------------------ write state buffers
+        enable_rfi = torch.tensor(self.cfg.dm_rand_config.enable_rfi, device=d)
+        rfi_lim_scale = torch.where(enable_rfi, rfi_lim_scale, torch.zeros_like(rfi_lim_scale))
+
+        # write state buffers
         # FieldState
         self.field_state.gf[env_ids]       = gf
         self.field_state.bf[env_ids]       = bf
@@ -642,11 +626,6 @@ class G1CatEnv(DirectRLEnv):
         self.push_state.push_interval_steps[env_ids] = push_interval_steps
 
 
-    # ------------------------------------------------------------------
-    # Abstract method stubs required by DirectRLEnv
-    # ------------------------------------------------------------------
- 
-    
     def _pre_physics_step(self, actions: torch.Tensor):
         self.actions = actions
 
@@ -663,8 +642,11 @@ class G1CatEnv(DirectRLEnv):
         push = torch.stack([torch.cos(push_theta), torch.sin(push_theta)], dim=-1)
         push = push * push_signal.unsqueeze(-1)
         push = push * push_magnitude.unsqueeze(-1)
-        # if not self.cfg.push_config.enable:
-        #    push.zero_()
+        push = torch.where(
+            torch.tensor(self.cfg.push_config.enable, device=self.device),
+            push,
+            torch.zeros_like(push),
+        )
 
         root_vel = self.robot.data.root_vel_w.clone()
         root_vel[:, :2] += push
@@ -703,8 +685,6 @@ class G1CatEnv(DirectRLEnv):
     def _get_observations(self) -> dict:
         """Assemble policy (state) and privileged (critic) observations.
 
-        Faithfully mirrors ``env_cat.py _get_obs(data, info, feet_contact)``.
-
         Policy state  (N, 162):
             noisy_gyro(3) + noisy_gvec(3) + noisy_Δjoint_pos(23) + noisy_joint_vel(23) +
             last_act(12) + motor_targets(12) + command_navi(4) + foot_height(1) +
@@ -717,35 +697,35 @@ class G1CatEnv(DirectRLEnv):
         noise_level  = self.cfg.noise_config.level
         noise_scales = self.cfg.noise_config.scales
 
-        # ------------------------------------------------------------------ IMU (pelvis root)
+        # IMU (pelvis root)
         gyro_pelvis   = self.robot.data.root_ang_vel_b           # (N, 3) angular vel in body frame
         gvec_pelvis   = self.robot.data.projected_gravity_b      # (N, 3) gravity direction in body frame
         linvel_pelvis = self.robot.data.root_lin_vel_b           # (N, 3) hint: local linear velocity
 
-        # ------------------------------------------------------------------ joint state
+        # joint state
         joint_pos_obs = self.robot.data.joint_pos[:, self._obs_joint_ids]   # (N, 23)
         joint_vel_obs = self.robot.data.joint_vel[:, self._obs_joint_ids]   # (N, 23)
         default_obs   = self._default_joint_pos[self._obs_joint_ids]        # (23,)
 
-        # ------------------------------------------------------------------ gait phase
+        # gait phase
         gait_phase = torch.cat([
             torch.cos(self.gait_state.phase),   # (N, 2)
             torch.sin(self.gait_state.phase),   # (N, 2)
         ], dim=-1)                               # (N, 4)
 
-        # ------------------------------------------------------------------ commands
+        # commands
         command       = self.cmd_state.command.clone()   # (N, 4)
         command_delay = self.cmd_state.command_delay     # (N, 4)
 
-        # ------------------------------------------------------------------ foot-ground contact
+        # foot-ground contact
         net_forces_ground = self._foot_ground_contact.data.net_forces_w          # (N, 2, 3)
         feet_contact = (torch.norm(net_forces_ground, dim=-1) > self._foot_ground_contact.cfg.force_threshold).float()  # (N, 2)
 
-        # ------------------------------------------------------------------ navi frame
+        # navi frame
         navi2world_rot = self.navi_state.navi2world_rot          # (N, 3, 3)
         nT = navi2world_rot.transpose(-1, -2)                    # (N, 3, 3)  world→navi rotation
 
-        # ------------------------------------------------------------------ observation noise
+        # observation noise
         noise_gyro = (2 * torch.rand_like(gyro_pelvis) - 1) * noise_level * noise_scales.gyro
         noise_gvec = (2 * torch.rand_like(gvec_pelvis) - 1) * noise_level * noise_scales.gravity
         noise_jpos = (2 * torch.rand_like(joint_pos_obs) - 1) * noise_level * noise_scales.joint_pos
@@ -756,7 +736,7 @@ class G1CatEnv(DirectRLEnv):
         noisy_jpos_obs = joint_pos_obs + noise_jpos    # (N, 23)
         noisy_jvel_obs = joint_vel_obs + noise_jvel    # (N, 23)
 
-        # ------------------------------------------------------------------ navi-frame delayed potential fields
+        # navi-frame delayed potential fields
         gf_delay = self.field_state.gf_delay   # (N, 11, 3)
         bf_delay = self.field_state.bf_delay   # (N, 11, 3)
         df_delay = self.field_state.df_delay   # (N, 11, 1)
@@ -768,13 +748,13 @@ class G1CatEnv(DirectRLEnv):
         bf_delay_navi_msk = bf_delay_navi * bf_mask            # (N, 11, 3)
         df_delay_clipped  = torch.clamp(df_delay, -1.0, 0.5)  # (N, 11, 1)
 
-        # ------------------------------------------------------------------ navi-frame command for policy obs
+        # navi-frame command for policy obs
         cmd_delay_vel      = command_delay[:, 1:4].unsqueeze(-1)                         # (N, 3, 1)
         cmd_vel_navi       = torch.bmm(nT, cmd_delay_vel).squeeze(-1)                    # (N, 3)
         command_for_policy = command.clone()
         command_for_policy[:, 1:4] = cmd_vel_navi
-        command_for_policy[:, 3]   = 0.0 
-        # ------------------------------------------------------------------ pf vector for policy obs (N, 77)
+        command_for_policy[:, 3]   = 0.0
+        # pf vector for policy obs (N, 77)
         # Ordering mirrors env_cat.py pf hstack:
         #   head(7) + pelv(7) + tors(7) + feet(14) + hands(14) + knees(14) + shlds(14)
         pf = torch.cat([
@@ -808,7 +788,7 @@ class G1CatEnv(DirectRLEnv):
             df_delay_clipped[:, 9:11, :].reshape(N, -1),
         ], dim=-1)  # (N, 77)
 
-        # ------------------------------------------------------------------ policy observation (state)  (N, 162)
+        # policy observation (state)  (N, 162)
         state = torch.cat([
             noisy_gyro,                                                   # 3
             noisy_gvec,                                                   # 3
@@ -820,8 +800,8 @@ class G1CatEnv(DirectRLEnv):
             self.gait_state.foot_height.unsqueeze(-1),                    # 1
             gait_phase,                                                   # 4
             pf,                                                           # 77
-        ], dim=-1)  # (N, 162) 
-        # ------------------------------------------------------------------ privileged observation (critic)  (N, 250)
+        ], dim=-1)  # (N, 162)
+        # privileged observation (critic)  (N, 250)
         gf_cur = self.field_state.gf   # (N, 11, 3)
         bf_cur = self.field_state.bf   # (N, 11, 3)
         df_cur = self.field_state.df   # (N, 11, 1)
@@ -885,7 +865,105 @@ class G1CatEnv(DirectRLEnv):
         return {"policy": state, "critic": privileged_state}
 
     def _get_rewards(self) -> torch.Tensor:
-        return torch.zeros(self.num_envs, device=self.device)
+        move_flag = self.cmd_state.command[:, 0]  # (N,)
+        cmd_vel = self.cmd_state.command[:, 1:4].clone()  # (N, 3) [x, y, yaw]
+
+        feet_contact_forces = self._foot_ground_contact.data.net_forces_w  # (N, 2, 3)
+        feet_contact = (
+            torch.norm(feet_contact_forces, dim=-1) > self._foot_ground_contact.cfg.force_threshold
+        ).float()  # (N, 2)
+
+        head_crossed = (move_flag.unsqueeze(-1) < 0.5) | (self.body_state.head_pos[:, 0:1] > 1.5)
+        feet_crossed = (
+            (move_flag.unsqueeze(-1) < 0.5)
+            | (self.gait_state.gait_mask == 1)
+            | (self.body_state.feet_pos[:, :, 0] > 1.5)
+        )
+        hands_crossed = (move_flag.unsqueeze(-1) < 0.5) | (self.body_state.hands_pos[:, :, 0] > 1.5)
+
+        reward_terms = {
+            # behavior reward
+            "tracking_orientation": self._reward_orientation(
+                self.navi_state.navi_pelvis_rpy,
+                self.navi_state.navi_torso_rpy,
+                self.body_state.head_pos[:, 2] > (self.cfg.torso_height[1] + 0.1),
+            ),
+            "tracking_root_field": self._reward_tracking_root_field(cmd_vel, self.vel_state.global_lin_vel),
+            "body_motion": self._cost_body_motion(
+                self.vel_state.global_lin_vel,
+                self.navi_state.navi_torso_ang_vel,
+                cmd_vel,
+            ),
+            "body_rotation": self._reward_body_rotation(cmd_vel[:, 2]),
+            "foot_contact": self._cost_foot_contact(feet_contact, self.gait_state.gait_mask, move_flag),
+            "foot_clearance": self._cost_foot_clearance(
+                self.body_state.feet_pos[:, :, 2],
+                self.gait_state.foot_height,
+                self.gait_state.gait_mask,
+                move_flag,
+            ),
+            "foot_slip": self._cost_foot_slip(self.body_state.feet_vel, self.gait_state.gait_mask),
+            "foot_balance": self._cost_foot_balance(
+                self.robot.data.root_com_pos_w,
+                self.body_state.feet_pos,
+                self.navi_state.navi2world_pose,
+            ),
+            "straight_knee": self._cost_straight_knee(self.robot.data.joint_pos[:, self._knee_joint_ids]),
+            "foot_far": self._cost_foot_far(self.body_state.feet_pos),
+            # energy reward
+            "joint_limits": self._cost_joint_pos_limits(self.robot.data.joint_pos),
+            "joint_torque": self._cost_torque(self.robot.data.applied_torque),
+            "smoothness_joint": self._cost_smoothness_joint(
+                self.robot.data.joint_vel[:, self._obs_joint_ids],
+                self.vel_state.last_joint_vel[:, self._obs_joint_ids],
+            ),
+            "smoothness_action": self._cost_smoothness_action(
+                self.actions,
+                self.action_state.last_act,
+                self.action_state.last_last_act,
+            ),
+            # field
+            "headgf": self._re_gf0(
+                self.field_state.headgf,
+                self.body_state.head_vel.unsqueeze(1),
+                self.field_state.headdf,
+                head_crossed,
+                tau=0.5,
+            ),
+            "feetgf": self._re_gf0(
+                self.field_state.feetgf,
+                self.body_state.feet_vel,
+                self.field_state.feetdf,
+                feet_crossed,
+                tau=0.3,
+            ),
+            "handsgf": self._re_gf0(
+                self.field_state.handsgf,
+                self.body_state.hands_vel,
+                self.field_state.handsdf,
+                hands_crossed,
+                tau=0.5,
+            ),
+            "headdf": self._re_sdf(self.field_state.headdf),
+            "feetdf": self._re_sdf(self.field_state.feetdf),
+            "handsdf": self._re_sdf(self.field_state.handsdf),
+            "kneesdf": self._re_sdf(self.field_state.kneesdf),
+            "shldsdf": self._re_sdf(self.field_state.shldsdf),
+        }
+
+        # Match env_cat.py behavior: replace NaNs before scaling.
+        for key, value in reward_terms.items():
+            reward_terms[key] = torch.where(torch.isnan(value), torch.zeros_like(value), value)
+
+        scales = self.cfg.reward_config.scales
+        scaled_terms = {key: value * getattr(scales, key) for key, value in reward_terms.items()}
+
+        reward = torch.clamp(torch.stack(list(scaled_terms.values()), dim=0).sum(dim=0) * self.step_dt, 0.0, 10000.0)
+
+        for key, value in scaled_terms.items():
+            self.extras["log"][f"Reward/{key}"] = value.mean()
+
+        return reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         self._post_physics_step()
@@ -902,7 +980,7 @@ class G1CatEnv(DirectRLEnv):
         min_df = self.field_state.df[:, :, 0].min(dim=1).values  # (N,)
         contact_term = contact_term | (min_df < -self.cfg.term_collision_threshold)
         contact_term = contact_term & (self.episode_length_buf >= 50)
-        joint_pos = self.robot.data.joint_pos[:, self._all_joint_ids]  # (N, 29)
+        joint_pos = self.robot.data.joint_pos  # (N, 29)
         nan_term: torch.Tensor = (
             torch.isnan(self.robot.data.root_pos_w).any(dim=-1)
             | torch.isnan(joint_pos).any(dim=-1)
@@ -911,8 +989,7 @@ class G1CatEnv(DirectRLEnv):
         terminated = fall_term | contact_term | nan_term
         truncated = self.episode_length_buf >= self.max_episode_length
         return terminated, truncated
-    
-    # ------------------------------------------------------------------
+
     def _post_physics_step(self):
         """Update all per-env state buffers after physics.  Mirrors env_cat.py step().
 
@@ -934,12 +1011,12 @@ class G1CatEnv(DirectRLEnv):
         N   = self.num_envs
         EPS = 1e-6
 
-        # ------------------------------------------------------------------ 1. velocity state
+        # 1. velocity state
         self.vel_state.local_lin_vel  = self.robot.data.root_lin_vel_b.clone()   # (N, 3)  pelvis local frame
         self.vel_state.global_lin_vel = self.robot.data.root_lin_vel_w.clone()   # (N, 3)  world frame
         self.vel_state.global_ang_vel = self.robot.data.root_ang_vel_w.clone()   # (N, 3)  world frame
 
-        # ------------------------------------------------------------------ 2. navi frame
+        # 2. navi frame
         pelv_quat_w = self.frame_transformer.data.target_quat_w[:, self._pelv_frame_idx, :]   # (N, 4) wxyz
         pelv_mat_w  = matrix_from_quat(pelv_quat_w)                                           # (N, 3, 3)
 
@@ -988,10 +1065,10 @@ class G1CatEnv(DirectRLEnv):
             nT, tors_ang_vel_w.unsqueeze(-1)
         ).squeeze(-1)   # (N, 3)
 
-        # ------------------------------------------------------------------ 3. last_command bookkeeping
+        # 3. last_command bookkeeping
         self.cmd_state.last_command = self.cmd_state.command.clone()   # (N, 4)
 
-        # ------------------------------------------------------------------ 4. body positions / velocities
+        # 4. body positions / velocities
         all_pos_w = self.frame_transformer.data.target_pos_w[:, self._all_site_idx, :]  # (N, 11, 3)
 
         head_pos_w, pelv_pos_w, tors_pos_w, feet_pos_w, hands_pos_w, knees_pos_w, shlds_pos_w = torch.split(
@@ -1001,9 +1078,9 @@ class G1CatEnv(DirectRLEnv):
         pelv_pos_w  = pelv_pos_w.squeeze(1)   # (N, 1, 3) -> (N, 3)
         tors_pos_w  = tors_pos_w.squeeze(1)   # (N, 1, 3) -> (N, 3)
 
-        head_vel  = (head_pos_w  - self.body_state.head_pos)  / self._ctrl_dt   # (N, 3)
-        feet_vel  = (feet_pos_w  - self.body_state.feet_pos)  / self._ctrl_dt   # (N, 2, 3)
-        hands_vel = (hands_pos_w - self.body_state.hands_pos) / self._ctrl_dt   # (N, 2, 3)
+        head_vel  = (head_pos_w  - self.body_state.head_pos)  / self.step_dt   # (N, 3)
+        feet_vel  = (feet_pos_w  - self.body_state.feet_pos)  / self.step_dt   # (N, 2, 3)
+        hands_vel = (hands_pos_w - self.body_state.hands_pos) / self.step_dt   # (N, 2, 3)
 
         self.body_state.head_pos  = head_pos_w
         self.body_state.head_vel  = head_vel
@@ -1016,19 +1093,19 @@ class G1CatEnv(DirectRLEnv):
         self.body_state.knees_pos = knees_pos_w
         self.body_state.shlds_pos = shlds_pos_w
 
-        # ------------------------------------------------------------------ 5. raw field sampling
+        # 5. raw field sampling
         gf = self.field_sampler.sample_gf(all_pos_w)    # (N, 11, 3)
         bf = self.field_sampler.sample_bf(all_pos_w)    # (N, 11, 3)
         df = self.field_sampler.sample_sdf(all_pos_w)   # (N, 11, 1)
 
-        # ------------------------------------------------------------------ 6. command from raw fields
+        # 6. command from raw fields
         pelvgf = gf[:, 1, :]                        # (N, 3)
         cgf    = gf[:, [0, 3, 4, 5, 6], :]          # (N, 5, 3)
         cbf    = bf[:, [0, 3, 4, 5, 6], :]          # (N, 5, 3)
         command = self.compute_cmd_from_rtf(pelvgf, cgf, cbf)  # (N, 4)
         self.cmd_state.command = command
 
-        # ------------------------------------------------------------------ 7. odom delay update
+        # 7. odom delay update
         update_mask = ((self.episode_length_buf % self.cfg.delay_update_interval) == 0)  # (N,) bool
         current_odom = self.robot.data.root_state_w[:, :7]  # (N, 7)  [x,y,z, qw,qx,qy,qz]
         odom_delay = torch.where(
@@ -1036,7 +1113,7 @@ class G1CatEnv(DirectRLEnv):
         )  # (N, 7)
         self.body_state.odom_delay = odom_delay
 
-        # ------------------------------------------------------------------ 8. delayed body poses + fields
+        # 8. delayed body poses + fields
         p_gt   = self.robot.data.root_pos_w    # (N, 3)
         q_gt   = self.robot.data.root_quat_w   # (N, 4) wxyz
         p_odom = odom_delay[:, :3]             # (N, 3)
@@ -1052,7 +1129,7 @@ class G1CatEnv(DirectRLEnv):
         bf_delay = self.field_sampler.sample_bf(all_poses_delay)   # (N, 11, 3)
         df_delay = self.field_sampler.sample_sdf(all_poses_delay)  # (N, 11, 1)
 
-        # ------------------------------------------------------------------ 9. gait phase update  (inlined _update_phase)
+        # 9. gait phase update  (inlined _update_phase)
         task_mask      = self.cmd_state.command[:, 0]       # move_flag after recompute  (N,)
         last_task_mask = self.cmd_state.last_command[:, 0]  # previous move_flag          (N,)
 
@@ -1090,7 +1167,7 @@ class G1CatEnv(DirectRLEnv):
         gait_mask  = torch.where(gait_cycle < -self._gait_bound, -1.0, gait_mask)
         self.gait_state.gait_mask = gait_mask
 
-        # ------------------------------------------------------------------ 10. GF / BF normalisation
+        # 10. GF / BF normalisation
         move_flag = self.cmd_state.command[:, 0].unsqueeze(-1).unsqueeze(-1)  # (N, 1, 1)
 
         gf_norm = gf * (move_flag > 0.5) / (torch.linalg.norm(gf, dim=-1, keepdim=True) + EPS)
@@ -1101,14 +1178,14 @@ class G1CatEnv(DirectRLEnv):
         )
         bf_delay_norm = bf_delay / (torch.linalg.norm(bf_delay, dim=-1, keepdim=True) + EPS)
 
-        # ------------------------------------------------------------------ 11. command_delay
+        # 11. command_delay
         pelvgf_delay = gf_delay_norm[:, 1, :]                   # (N, 3)
         cgf_delay    = gf_delay_norm[:, [0, 3, 4, 5, 6], :]     # (N, 5, 3)
         cbf_delay    = bf_delay_norm[:, [0, 3, 4, 5, 6], :]     # (N, 5, 3)
         command_delay = self.compute_cmd_from_rtf(pelvgf_delay, cgf_delay, cbf_delay)  # (N, 4)
         self.cmd_state.command_delay = command_delay
 
-        # ------------------------------------------------------------------ 12. field state write-back
+        # 12. field state write-back
         self.field_state.gf       = gf_norm
         self.field_state.bf       = bf_norm
         self.field_state.df       = df
@@ -1116,9 +1193,447 @@ class G1CatEnv(DirectRLEnv):
         self.field_state.bf_delay = bf_delay_norm
         self.field_state.df_delay = df_delay
 
-        self.vel_state.last_joint_vel = self.robot.data.joint_vel[:, self._all_joint_ids].clone()
+        # Store in robot-native order (not reindexed) so that later indexing with
+        # self._obs_joint_ids (robot-native) in the smoothness reward is correct.
+        self.vel_state.last_joint_vel = self.robot.data.joint_vel.clone()
         self.vel_state.last_feet_vel = feet_vel[:, :, 2]
 
+    def _reward_orientation(
+        self,
+        pelvis_rpy: torch.Tensor,
+        torso_rpy: torch.Tensor,
+        idle_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reward for maintaining upright orientation.
+
+        Computes exponential reward based on roll and pitch errors of pelvis
+        and torso. Includes special handling for idle (non-moving) state.
+
+        Args:
+            pelvis_rpy: Pelvis roll-pitch-yaw in navi frame, shape (N, 3).
+            torso_rpy: Torso roll-pitch-yaw in navi frame, shape (N, 3).
+            idle_mask: Boolean mask for idle state (head height > threshold),
+                shape (N,).
+
+        Returns:
+            Orientation reward, shape (N,).
+        """
+        err_roll = torch.abs(pelvis_rpy[:, 0]) + torch.abs(torso_rpy[:, 0])
+        err_pitch_dire = torch.abs(torch.clamp(torso_rpy[:, 1], -math.pi, 0.0))
+        err_pitch_idle = idle_mask.float() * torch.abs(torso_rpy[:, 1])
+        err_ori = err_roll + err_pitch_dire + err_pitch_idle
+        rew = torch.exp(-0.5 * err_ori) - err_pitch_dire
+        return rew
+
+    def _reward_tracking_root_field(
+        self,
+        cmd_vel: torch.Tensor,
+        local_lin_vel: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reward for tracking the velocity command from potential field.
+
+        Computes exponential reward based on XY velocity tracking error.
+
+        Args:
+            cmd_vel: Commanded velocity [vx, vy, vyaw], shape (N, 3).
+            local_lin_vel: Actual local linear velocity, shape (N, 3).
+
+        Returns:
+            Tracking reward, shape (N,).
+        """
+        lin_vel_error = torch.sum(torch.square(cmd_vel[:, :2] - local_lin_vel[:, :2]), dim=-1)
+        return torch.exp(-4.0 * lin_vel_error)
+
+    def _cost_body_motion(
+        self,
+        local_lin_vel: torch.Tensor,
+        local_ang_vel: torch.Tensor,
+        cmd_vel: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for unwanted body motion (orthogonal to command direction).
+
+        Penalizes:
+        - Velocity orthogonal to command direction in XY plane
+        - Roll and pitch angular velocities
+
+        Args:
+            local_lin_vel: Local linear velocity, shape (N, 3).
+            local_ang_vel: Local angular velocity, shape (N, 3).
+            cmd_vel: Commanded velocity [vx, vy, vyaw], shape (N, 3).
+
+        Returns:
+            Motion cost (negative reward), shape (N,).
+        """
+        cmd_xy = cmd_vel[:, :2]
+        cmd_norm = torch.linalg.norm(cmd_xy, dim=-1)
+        is_zero_cmd = torch.isclose(cmd_norm, torch.zeros_like(cmd_norm))
+
+        # Safe command direction (avoid division by zero)
+        cmd_dir = torch.where(
+            is_zero_cmd.unsqueeze(-1),
+            torch.zeros_like(cmd_xy),
+            cmd_xy / (cmd_norm.unsqueeze(-1) + 1e-6),
+        )
+
+        # Velocity orthogonal to command direction
+        lin_xy = local_lin_vel[:, :2]
+        lin_xy_proj = torch.sum(lin_xy * cmd_dir, dim=-1, keepdim=True) * cmd_dir
+        lin_xy_orth = lin_xy - lin_xy_proj
+        cost_lin_xy_orth = torch.where(
+            is_zero_cmd,
+            torch.zeros_like(is_zero_cmd),
+            torch.sum(torch.square(lin_xy_orth), dim=-1),
+        )
+
+        cost = (
+            1.2 * cost_lin_xy_orth
+            + 0.4 * torch.abs(local_ang_vel[:, 0])
+            + 0.4 * torch.abs(local_ang_vel[:, 1])
+        )
+        return cost
+
+    def _reward_body_rotation(
+        self,
+        cmd_vel_yaw: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reward for proper leg alignment with navigation frame.
+
+        Encourages legs to be aligned with the navi frame (minimizing
+        roll and yaw deviations of leg links). The yaw penalty decays
+        when spinning fast.
+
+        Uses 4 leg bodies (knee_link + ankle_roll_link for each leg) to match
+        the JAX implementation which uses body_ids_left_leg + body_ids_right_leg.
+
+        The rotation matrix legs2navi transforms from leg frame to navi frame.
+        Its columns are the leg frame basis vectors expressed in navi coordinates:
+        - R[:, 0] = leg x-axis in navi coords
+        - R[:, 1] = leg y-axis in navi coords
+        - R[:, 2] = leg z-axis in navi coords
+
+        The error metrics use R[:, 1] (leg's y-axis) because for a biped:
+        - In neutral pose, leg y-axis should align with navi y-axis (pointing left)
+        - R[2,1] = z-component of leg's y-axis → roll error (tilted up/down)
+        - R[0,1] = x-component of leg's y-axis → yaw error (pointing forward/back)
+
+        Args:
+            cmd_vel_yaw: Commanded yaw velocity, shape (N,).
+
+        Returns:
+            Body rotation reward, shape (N,).
+        """
+        cmd_max = abs(self.cfg.ang_vel_yaw[1]) + 1e-6
+        cmd_decay = torch.clamp((cmd_max - torch.abs(cmd_vel_yaw)) / cmd_max, 0.0, 1.0) ** 2
+        navi2world_rot = self.navi_state.navi2world_rot  # (N, 3, 3)
+        world2navi_rot = navi2world_rot.transpose(-1, -2)  # (N, 3, 3)
+        legs_quat = self.frame_transformer.data.target_quat_w[:, self._leg_body_frame_idx, :]  # (N, 4, 4) wxyz
+        legs2world_rot = matrix_from_quat(legs_quat.reshape(-1, 4)).reshape(-1, 4, 3, 3)
+        legs2navi_rot = world2navi_rot.unsqueeze(1) @ legs2world_rot # (N, 4, 3, 3)
+        axis_roll_err = torch.abs(legs2navi_rot[:, :, 2, 1])  # (N, 4)
+        axis_yaw_err = cmd_decay.unsqueeze(-1) * torch.abs(legs2navi_rot[:, :, 0, 1])  # (N, 4)
+        axis_rew = torch.exp(-5.0 * (axis_roll_err.mean(dim=-1) + axis_yaw_err.mean(dim=-1)))
+        return axis_rew
+
+    def _cost_foot_contact(
+        self,
+        feet_contact: torch.Tensor,
+        gait_mask: torch.Tensor,
+        move_flag: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for incorrect foot contact timing.
+
+        Penalizes feet not matching the desired gait phase (swing vs stance).
+
+        Args:
+            feet_contact: Binary foot contact state, shape (N, 2).
+            gait_mask: Gait phase mask {-1: swing, 0: transition, 1: stance},
+                shape (N, 2).
+            move_flag: Binary move flag, shape (N,).
+
+        Returns:
+            Contact cost, shape (N,).
+        """
+        stance = feet_contact != 0
+        swing = feet_contact == 0
+        stance_des = (gait_mask == 1).float()
+        swing_des = (gait_mask == -1).float()
+        is_constrained = (gait_mask != 0).float()
+
+        cost_stance = torch.sum(
+            torch.abs(stance.float() - stance_des) * is_constrained, dim=-1
+        )
+        cost_swing = torch.sum(
+            torch.abs(swing.float() - swing_des) * is_constrained, dim=-1
+        )
+        cost = (cost_stance + cost_swing) * move_flag
+        return cost
+
+    def _cost_foot_clearance(
+        self,
+        foot_z: torch.Tensor,
+        tar_foot_height: torch.Tensor,
+        gait_mask: torch.Tensor,
+        move_flag: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for foot not reaching desired height during swing.
+
+        Penalizes deviation from target foot height during swing phase.
+
+        Args:
+            foot_z: Foot Z positions, shape (N, 2).
+            tar_foot_height: Target foot swing height per env, shape (N,).
+            gait_mask: Gait phase mask, shape (N, 2).
+            move_flag: Binary move flag, shape (N,).
+
+        Returns:
+            Clearance cost, shape (N,).
+        """
+        swing_des = (gait_mask == -1).float()
+        foot_z_tar = self.cfg.reward_config.foot_height_stance + tar_foot_height.unsqueeze(-1)
+        cost = torch.sum(swing_des * torch.square(foot_z - foot_z_tar), dim=-1)
+        cost = cost * move_flag
+        return cost
+
+    def _cost_foot_slip(
+        self,
+        feet_vel: torch.Tensor,
+        gait_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for foot slipping during stance.
+
+        Penalizes foot velocity when foot should be in stance.
+
+        Args:
+            feet_vel: Foot linear velocities, shape (N, 2, 3).
+            gait_mask: Gait phase mask, shape (N, 2).
+
+        Returns:
+            Slip cost, shape (N,).
+        """
+        stance_des = (gait_mask == 1).float()
+        feet_vel_norm = torch.linalg.norm(feet_vel, dim=-1)
+        cost = torch.sum(torch.square(feet_vel_norm) * stance_des, dim=-1)
+        return cost
+
+    def _cost_foot_balance(
+        self,
+        com_pos: torch.Tensor,
+        foot_pos: torch.Tensor,
+        navi2world_pose: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for poor foot placement relative to COM.
+
+        Encourages feet to be placed such that the COM projection is centered
+        between the feet in the navigation frame. Includes foot spread penalty.
+
+        Args:
+            com_pos: Center of mass position in world frame, shape (N, 3).
+            foot_pos: Foot positions in world frame, shape (N, 2, 3).
+            navi2world_pose: Navi-to-world pose matrices, shape (N, 4, 4).
+
+        Returns:
+            Balance cost, shape (N,).
+        """
+        # Build support positions: [COM, left_foot, right_foot] in homogeneous coords
+        N = com_pos.shape[0]
+        sup2world_pos_h = torch.ones(N, 3, 4, device=self.device)
+        sup2world_pos_h[:, 0, :3] = com_pos
+        sup2world_pos_h[:, 1, :3] = foot_pos[:, 0]
+        sup2world_pos_h[:, 2, :3] = foot_pos[:, 1]
+
+        # Transform to navi frame
+        navi2world_pose_inv = torch.linalg.inv(navi2world_pose)
+        sup2navi_pos = torch.bmm(sup2world_pos_h, navi2world_pose_inv.transpose(-1, -2))[:, :, :3]
+
+        # Foot to COM error in navi frame
+        foot2com_err = sup2navi_pos[:, 1:] - sup2navi_pos[:, :1]  # (N, 2, 3)
+        foot_center = foot2com_err[:, 0, :2] + foot2com_err[:, 1, :2]  # (N, 2)
+        cost_support = torch.sum(torch.square(foot_center), dim=-1)
+
+        # Foot spread penalty
+        foot_distance = torch.linalg.norm(foot_pos[:, 0] - foot_pos[:, 1], dim=-1)
+        foot_spread_penalty = torch.where(
+            foot_distance < 0.35,
+            (0.35 - foot_distance),
+            torch.zeros_like(foot_distance),
+        ) * 10.0
+
+        cost_support = cost_support * (1.0 + foot_spread_penalty)
+        return cost_support
+
+    def _cost_straight_knee(self, knee_pos: torch.Tensor) -> torch.Tensor:
+        """Cost for knees being too straight (near singular configuration).
+
+        Encourages slightly bent knees for better stability.
+
+        Args:
+            knee_pos: Knee joint positions, shape (N, 2).
+
+        Returns:
+            Straight knee cost, shape (N,).
+        """
+        penalty = torch.clamp(0.1 - knee_pos, min=0.0)
+        return torch.sum(penalty, dim=-1)
+
+    def _cost_foot_far(self, foot_pos: torch.Tensor) -> torch.Tensor:
+        """Cost for feet being too close together.
+
+        Encourages wider stance for better stability.
+
+        Args:
+            foot_pos: Foot positions in world frame, shape (N, 2, 3).
+
+        Returns:
+            Foot spread cost, shape (N,).
+        """
+        foot_distance = torch.linalg.norm(foot_pos[:, 0] - foot_pos[:, 1], dim=-1)
+        foot_spread_penalty = torch.where(
+            foot_distance < 0.35,
+            (0.35 - foot_distance),
+            torch.zeros_like(foot_distance),
+        )
+        return foot_spread_penalty
+
+    def _cost_joint_pos_limits(self, joint_pos: torch.Tensor) -> torch.Tensor:
+        """Cost for joints approaching position limits.
+
+        Penalizes joints that exceed soft position limits.
+
+        Args:
+            joint_pos: Joint positions, shape (N, num_joints).
+
+        Returns:
+            Joint limit cost, shape (N,).
+        """
+        # Penalize joints if they cross soft limits
+        out_of_limits = -torch.clamp(joint_pos - self._soft_lowers, max=0.0)
+        out_of_limits += torch.clamp(joint_pos - self._soft_uppers, min=0.0)
+        return torch.sum(out_of_limits, dim=-1)
+
+    def _cost_torque(self, torques: torch.Tensor) -> torch.Tensor:
+        """Cost for high joint torques (energy penalty).
+
+        Args:
+            torques: Applied joint torques, shape (N, num_joints).
+
+        Returns:
+            Torque cost, shape (N,).
+        """
+        return torch.sum(torch.square(torques), dim=-1)
+
+    def _cost_smoothness_joint(
+        self,
+        obs_joint_vel: torch.Tensor,
+        last_obs_joint_vel: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for non-smooth joint motion (acceleration penalty).
+
+        Penalizes high joint velocities and accelerations for observation joints only.
+
+        Args:
+            obs_joint_vel: Current observation joint velocities, shape (N, obs_dim).
+            last_obs_joint_vel: Previous observation joint velocities, shape (N, obs_dim).
+
+        Returns:
+            Smoothness cost, shape (N,).
+        """
+        qacc = (obs_joint_vel - last_obs_joint_vel) / self.step_dt
+        cost = torch.sum(0.01 * torch.square(obs_joint_vel) + torch.square(qacc), dim=-1)
+        return cost
+
+    def _cost_smoothness_action(
+        self,
+        action: torch.Tensor,
+        last_action: torch.Tensor,
+        last_last_action: torch.Tensor,
+    ) -> torch.Tensor:
+        """Cost for non-smooth actions.
+
+        Penalizes large action values, first-order differences, and
+        second-order differences (jerk).
+
+        Args:
+            action: Current action, shape (N, action_dim).
+            last_action: Previous action, shape (N, action_dim).
+            last_last_action: Action from two steps ago, shape (N, action_dim).
+
+        Returns:
+            Action smoothness cost, shape (N,).
+        """
+        smooth_0th = torch.square(action)
+        smooth_1st = torch.square(action - last_action)
+        smooth_2nd = torch.square(action - 2 * last_action + last_last_action)
+        cost = torch.sum(smooth_0th + smooth_1st + smooth_2nd, dim=-1)
+        return cost
+
+    def _re_gf0(
+        self,
+        gf_vel: torch.Tensor,
+        lin_vel: torch.Tensor,
+        sdf: torch.Tensor,
+        crossed: torch.Tensor,
+        tau: float = 0.3,
+    ) -> torch.Tensor:
+        """Guidance field alignment reward.
+
+        Rewards velocity alignment with guidance field near obstacles.
+        The reward is windowed by distance to obstacle (via SDF).
+
+        Args:
+            gf_vel: Guidance field velocity vectors, shape (N, M, 3).
+            lin_vel: Body linear velocities, shape (N, M, 3).
+            sdf: Signed distance field values, shape (N, M, 1).
+            crossed: Mask for already-crossed regions, shape (N, M).
+            tau: Distance threshold for windowing, default 0.3.
+
+        Returns:
+            Mean guidance field reward across sites, shape (N,).
+        """
+        eps = 1e-6
+        k_window = 40.0
+        alpha_align = 5.0
+
+        # Normalize vectors
+        g_norm = gf_vel / (torch.linalg.norm(gf_vel, dim=-1, keepdim=True) + eps)
+        v_norm = lin_vel / (torch.linalg.norm(lin_vel, dim=-1, keepdim=True) + eps)
+
+        # Cosine similarity
+        cos_align = torch.sum(g_norm * v_norm, dim=-1)  # (N, M)
+
+        # Distance-based window
+        sdf_flat = sdf.squeeze(-1)  # (N, M)
+        window = torch.sigmoid(k_window * (tau - sdf_flat))
+
+        reward_near = window * (alpha_align * cos_align)
+        reward_near = torch.where(crossed, alpha_align * 0.8, reward_near)
+
+        return reward_near.mean(dim=-1)
+
+    def _re_sdf(
+        self,
+        sdf: torch.Tensor,
+        sdf_safe: float = 0.05,
+    ) -> torch.Tensor:
+        """Signed distance field penalty.
+
+        Penalizes being inside or too close to obstacles.
+
+        Args:
+            sdf: Signed distance field values, shape (N, M, 1).
+                Negative values indicate inside obstacle.
+            sdf_safe: Safe distance threshold, default 0.05m.
+
+        Returns:
+            Mean SDF penalty across sites, shape (N,).
+        """
+        beta_inside = 0.02
+        pen_inside_scale = 20.0
+
+        sdf_flat = sdf.squeeze(-1)  # (N, M)
+        pen_inside = torch.nn.functional.softplus((sdf_safe - sdf_flat) / beta_inside)
+
+        penalty = pen_inside_scale * pen_inside
+        return -penalty.mean(dim=-1)
 
     def compute_cmd_from_rtf(
         self,
@@ -1208,4 +1723,4 @@ class G1CatEnv(DirectRLEnv):
 
         return command
 
-#NOTE: Use where to replace if
+

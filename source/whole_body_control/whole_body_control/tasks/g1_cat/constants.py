@@ -7,35 +7,6 @@ from isaaclab.assets.articulation import ArticulationCfg
 from whole_body_control.assets import ASSET_DIR
 
 # ==============================================================================
-# Step 1.2 — Body Collision Groups
-# Used for SDF-based collision termination (ContactSensor / FrameTransformer).
-# Bodies correspond to the MuJoCo sites actually sampled in env_cat.py:
-#   headdf   → "head" site on torso_link
-#   pelvdf   → "imu_in_pelvis" site on pelvis
-#   torsdf   → "imu_in_torso" site on torso_link
-#   feetdf   → "left_foot"/"right_foot" sites on ankle_roll_links
-#   handsdf  → "left_palm"/"right_palm" sites on wrist_yaw_links
-#   kneesdf  → "left_knee"/"right_knee" sites on knee_links
-#   shldsdf  → "left_shoulder"/"right_shoulder" sites on shoulder_pitch_links
-# ==============================================================================
-
-HEAD_BODIES     = ["torso_link"]
-PELVIS_BODIES   = ["pelvis"]
-TORSO_BODIES    = ["torso_link"]
-FEET_BODIES     = ["left_ankle_roll_link", "right_ankle_roll_link"]
-HAND_BODIES     = ["left_wrist_yaw_link",  "right_wrist_yaw_link"]
-KNEE_BODIES     = ["left_knee_link",       "right_knee_link"]
-SHOULDER_BODIES = ["left_shoulder_pitch_link", "right_shoulder_pitch_link"]
-
-# G1CatEnv  (student)  — all 7 groups, enabled after step ≥ 50
-STUDENT_COLLISION_BODIES = (
-    HEAD_BODIES + FEET_BODIES + HAND_BODIES
-    + KNEE_BODIES + SHOULDER_BODIES + PELVIS_BODIES + TORSO_BODIES
-)
-# G1CatPriEnv (teacher) — 3 groups only, enabled after step ≥ 100
-PRIVILEGED_COLLISION_BODIES = HEAD_BODIES + FEET_BODIES + HAND_BODIES
-
-# ==============================================================================
 # FrameTransformer frame names for each body-site group.
 # These mirror the MuJoCo site IDs used in env_cat.py.
 # ==============================================================================
