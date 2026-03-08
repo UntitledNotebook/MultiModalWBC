@@ -2,16 +2,17 @@ from __future__ import annotations
 
 import torch
 
-from isaaclab.utils import configclass
+import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import PhysxCfg, SimulationCfg
-from isaaclab.sensors import FrameTransformerCfg, ContactSensorCfg
+from isaaclab.sensors import ContactSensorCfg, FrameTransformerCfg
 from isaaclab.sensors.frame_transformer import OffsetCfg
+from isaaclab.sim import PhysxCfg, SimulationCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils import configclass
 
-from .constants import G1_CAT_CFG, SITE_BODY_OFFSETS
-import isaaclab.sim as sim_utils
+from .constants import G1_CAT_CFG, SITE_BODY_OFFSETS, ASSET_DIR, ALL_FRAME_NAMES
 
 # ==============================================================================
 # Nested sub-configs (mirrors config_dict.create(...) in env_cat.py)
@@ -110,120 +111,67 @@ class CommandCfg:
 @configclass
 class PfCfg:
     """Potential-field (navigation field) configuration."""
-    path: str = "data/TypiObs/bar0"
+    path: str = f"{ASSET_DIR}/data/assets/TypiObs/empty/"
     dx: float = 0.04
     # World-frame origin of the loaded field grid (x, y, z)
     origin: tuple[float, float, float] = (-0.5, -1.0, 0.0)
 
 
-# ==============================================================================
-# Scene configuration
-# ==============================================================================
-
 @configclass
 class G1CatSceneCfg(InteractiveSceneCfg):
-    """Scene with G1 robot, ground plane, and sensors."""
-
-    # num_envs: int = 4096
-    num_envs: int = 128
-    env_spacing: float = 6.0
-
-    # Robot
-    robot: ArticulationCfg = G1_CAT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-
-    # Obstacle mesh from pf_config
-    obstacle = AssetBaseCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacle",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path="data/TypiObs/bar0/obs.usd"
+    """Scene configuration for G1 Cat environment."""
+    # ground terrain 
+    terrain = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=sim_utils.RigidBodyMaterialCfg(
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
         ),
-        init_state=AssetBaseCfg.InitialStateCfg(
-            pos=(-0.5, -1.0, 0.0),
-        )
+        debug_vis=False,
     )
-
-    # FrameTransformer: track body sites using offsets from SITE_BODY_OFFSETS
-    frame_transformer = FrameTransformerCfg(
+    # robot
+    robot: ArticulationCfg = G1_CAT_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    # lights
+    light = AssetBaseCfg(
+        prim_path="/World/Light",
+        spawn=sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75)),
+    )
+    # frame transformer
+    frame_transformer: FrameTransformerCfg = FrameTransformerCfg(
         prim_path="{ENV_REGEX_NS}/Robot/pelvis",
         target_frames=[
             FrameTransformerCfg.FrameCfg(
-                name="head",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['head'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['head'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="left_foot",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['left_foot'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['left_foot'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="right_foot",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['right_foot'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['right_foot'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="left_palm",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['left_palm'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['left_palm'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="right_palm",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['right_palm'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['right_palm'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="imu_in_pelvis",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['imu_in_pelvis'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['imu_in_pelvis'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="imu_in_torso",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['imu_in_torso'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['imu_in_torso'][1]),
-            ),
-            # Zero-offset sites (for collision check / convenience)
-            FrameTransformerCfg.FrameCfg(
-                name="left_knee",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['left_knee'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['left_knee'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="right_knee",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['right_knee'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['right_knee'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="left_shoulder",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['left_shoulder'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['left_shoulder'][1]),
-            ),
-            FrameTransformerCfg.FrameCfg(
-                name="right_shoulder",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS['right_shoulder'][0]}",
-                offset=OffsetCfg(pos=SITE_BODY_OFFSETS['right_shoulder'][1]),
-            ),
+                name=n,
+                prim_path=f"{{ENV_REGEX_NS}}/Robot/{SITE_BODY_OFFSETS[n][0]}",
+                offset=OffsetCfg(pos=SITE_BODY_OFFSETS[n][1]),
+            )
+            for n in ALL_FRAME_NAMES
+        ] + [
             FrameTransformerCfg.FrameCfg(
                 name="left_ankle_roll",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/left_ankle_roll_link",
+                prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
                 offset=OffsetCfg(pos=(0.0, 0.0, 0.0)),
             ),
             FrameTransformerCfg.FrameCfg(
                 name="right_ankle_roll",
-                prim_path=f"{{ENV_REGEX_NS}}/Robot/right_ankle_roll_link",
+                prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
                 offset=OffsetCfg(pos=(0.0, 0.0, 0.0)),
             ),
         ],
     )
-
+    # contact sensors
     foot_ground_contact = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*ankle_roll_link",
         history_length=1,
         update_period=0.0,
         track_air_time=True,
         force_threshold=1.0,
-        filter_prim_paths_expr=["/World/ground"],
-    )
-
+    ) # NOTE: No filter_prim_paths_expr is set here, so this sensor measures the total net contact force on the ankle links from ALL contact surfaces (ground + obstacles). This is NOT the same as pure foot-ground contact — obstacle contact forces are included.
     left_foot_self_contact = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",
         history_length=1,
@@ -234,7 +182,6 @@ class G1CatSceneCfg(InteractiveSceneCfg):
         ],
         force_threshold=1.0,
     )
-
     right_foot_self_contact = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/right_ankle_roll_link",
         history_length=1,
@@ -245,40 +192,41 @@ class G1CatSceneCfg(InteractiveSceneCfg):
         ],
         force_threshold=1.0,
     )
+    # Obstacle
+    obstacle: AssetBaseCfg = AssetBaseCfg(
+        prim_path="{ENV_REGEX_NS}/Obstacle",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=f"{ASSET_DIR}/data/assets/TypiObs/empty/obs.usd",
+            # Recommended: make it truly static (no dynamics, no gravity)
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=True,
+                kinematic_enabled=True,
+                max_depenetration_velocity=0.0,
+            ),
+        ),
+        init_state=AssetBaseCfg.InitialStateCfg(pos=(-0.5, -1.0, 0.0)),
+    ) # Issue: the usd conversion should use proper parameters to disable dynamics
 
-
-# ==============================================================================
-# Top-level environment configuration
-# ==============================================================================
 
 @configclass
 class G1CatEnvCfg(DirectRLEnvCfg):
     """Configuration for G1 Cat student environment (Direct workflow).
-
-    Timing:
-        sim_dt  = 0.002 s  (500 Hz physics)
-        ctrl_dt = 0.020 s  (50 Hz policy)  → decimation = 10
-        episode = 1 000 policy steps        → episode_length_s = 20 s
     """
 
     # ------------------------------------------------------------------
     # DirectRLEnvCfg MISSING fields (must be provided)
     # ------------------------------------------------------------------
 
-    # Physics simulation: dt=0.002 s matches original sim_dt
+    # Simulation
     sim: SimulationCfg = SimulationCfg(dt=0.002, render_interval=10)
-
-    # Scene
-    scene: G1CatSceneCfg = G1CatSceneCfg(num_envs=4096, env_spacing=6.0)
+    # Scene 
+    scene: G1CatSceneCfg = G1CatSceneCfg(num_envs=64, env_spacing=6.0, replicate_physics=True)
 
     # Timing
     decimation: int = 10                  # ctrl_dt / sim_dt = 0.02 / 0.002
     episode_length_s: float = 20.0        # 1000 steps × 0.02 s
 
     # Observation / action spaces
-    # student obs = 162, privileged (critic) state = 250, actions = 12
-    # privileged breakdown: 52+33+3+77+48+6+31 = 250
-    #   IMU+joints(52) + controls+gait(33) + linvel(3) + PF(77) + body(48) + status(6) + domain_rand(31)
     observation_space: int = 162
     state_space: int = 250
     action_space: int = 12
@@ -290,19 +238,11 @@ class G1CatEnvCfg(DirectRLEnvCfg):
     action_scale: float = 0.5
     history_len: int = 15
     restricted_joint_range: bool = False
-    soft_joint_pos_limit_factor: float = 0.95
-
-    # Velocity command ranges [min, max]
     lin_vel_x: tuple[float, float] = (-0.5, 0.5)
     lin_vel_y: tuple[float, float] = (-0.3, 0.3)
     ang_vel_yaw: tuple[float, float] = (-0.5, 0.5)
-    # Torso height range [min, max]; upper bound = DEFAULT_CHEST_Z = 1.0
     torso_height: tuple[float, float] = (0.5, 1.0)
-
-    # SDF-based collision termination threshold (metres)
     term_collision_threshold: float = 0.04
-
-    # Delayed odometry update interval (steps)
     delay_update_interval: int = 5
 
     # ------------------------------------------------------------------

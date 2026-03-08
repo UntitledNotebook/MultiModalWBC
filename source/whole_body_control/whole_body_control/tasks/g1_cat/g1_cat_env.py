@@ -4,17 +4,12 @@ import math
 from dataclasses import dataclass
 from typing import Sequence, TYPE_CHECKING
 
-from isaaclab.sensors import ContactSensor
-
-if TYPE_CHECKING:
-    from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
-
 import torch
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
-from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
-from isaaclab.sensors import FrameTransformer
+from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
+from isaaclab.sensors import ContactSensor, FrameTransformer
 from isaaclab.utils.math import (
     euler_xyz_from_quat,
     matrix_from_quat,
@@ -26,12 +21,12 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
-from .g1_cat_env_cfg import G1CatEnvCfg
-from .utils import FieldSampler
 from .constants import (
     ACTION_JOINT_NAMES, OBS_JOINT_NAMES, ALL_JOINT_NAMES,
     KPS, KDS, TORQUE_LIMIT, NUM_FIELD_SITES, ALL_FRAME_NAMES,
 )
+from .g1_cat_env_cfg import G1CatEnvCfg
+from .utils import FieldSampler
 
 @dataclass
 class CommandState:
@@ -329,6 +324,10 @@ class G1CatEnv(DirectRLEnv):
         self._pelv_body_idx = pelv_body_idx[0]   # scalar: index of pelvis in body list
         self._tors_body_idx = tors_body_idx[0]   # scalar: index of torso_link in body list
 
+        left_ankle_body_idx, _ = self.robot.find_bodies("left_ankle_roll_link")
+        right_ankle_body_idx, _ = self.robot.find_bodies("right_ankle_roll_link")
+        self._ankle_body_ids = [left_ankle_body_idx[0], right_ankle_body_idx[0]]
+
         # contact sensors
         self._foot_ground_contact: ContactSensor = self.scene.sensors["foot_ground_contact"]
         self._left_foot_contact:   ContactSensor = self.scene.sensors["left_foot_self_contact"]
@@ -420,20 +419,7 @@ class G1CatEnv(DirectRLEnv):
         )
 
     def _setup_scene(self):
-        super()._setup_scene()
-        self.robot = Articulation(self.cfg.scene.robot)
-        spawn_ground_plane(
-            prim_path="/World/ground",
-            cfg=GroundPlaneCfg(
-                physics_material=sim_utils.RigidBodyMaterialCfg(
-                    static_friction=1.0, dynamic_friction=1.0, restitution=0.0
-                ),
-            ),
-        )
-        self.scene.clone_environments()
-        self.scene.articulations["robot"] = self.robot
-        light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
-        light_cfg.func("/World/Light", light_cfg)
+        self.robot = self.scene.articulations["robot"]
 
     def _reset_idx(self, env_ids: Sequence[int]):
         """Reset selected environments, faithfully following env_cat.py reset().
@@ -717,9 +703,9 @@ class G1CatEnv(DirectRLEnv):
         command       = self.cmd_state.command.clone()   # (N, 4)
         command_delay = self.cmd_state.command_delay     # (N, 4)
 
-        # foot-ground contact
-        net_forces_ground = self._foot_ground_contact.data.net_forces_w          # (N, 2, 3)
-        feet_contact = (torch.norm(net_forces_ground, dim=-1) > self._foot_ground_contact.cfg.force_threshold).float()  # (N, 2)
+        # foot contact (all surfaces: ground + obstacles)
+        net_forces_feet = self._foot_ground_contact.data.net_forces_w          # (N, 2, 3)
+        feet_contact = (torch.norm(net_forces_feet, dim=-1) > self._foot_ground_contact.cfg.force_threshold).float()  # (N, 2)
 
         # navi frame
         navi2world_rot = self.navi_state.navi2world_rot          # (N, 3, 3)
@@ -902,7 +888,10 @@ class G1CatEnv(DirectRLEnv):
                 self.gait_state.gait_mask,
                 move_flag,
             ),
-            "foot_slip": self._cost_foot_slip(self.body_state.feet_vel, self.gait_state.gait_mask),
+            "foot_slip": self._cost_foot_slip(
+                self.robot.data.body_lin_vel_w[:, self._ankle_body_ids, :],
+                self.gait_state.gait_mask,
+            ),
             "foot_balance": self._cost_foot_balance(
                 self.robot.data.root_com_pos_w,
                 self.body_state.feet_pos,
@@ -1281,7 +1270,7 @@ class G1CatEnv(DirectRLEnv):
         lin_xy_orth = lin_xy - lin_xy_proj
         cost_lin_xy_orth = torch.where(
             is_zero_cmd,
-            torch.zeros_like(is_zero_cmd),
+            torch.zeros_like(cmd_norm),
             torch.sum(torch.square(lin_xy_orth), dim=-1),
         )
 
@@ -1593,9 +1582,13 @@ class G1CatEnv(DirectRLEnv):
         k_window = 40.0
         alpha_align = 5.0
 
-        # Normalize vectors
-        g_norm = gf_vel / (torch.linalg.norm(gf_vel, dim=-1, keepdim=True) + eps)
-        v_norm = lin_vel / (torch.linalg.norm(lin_vel, dim=-1, keepdim=True) + eps)
+        # Normalize vectors with safe division
+        gf_norm = torch.linalg.norm(gf_vel, dim=-1, keepdim=True)
+        lv_norm = torch.linalg.norm(lin_vel, dim=-1, keepdim=True)
+
+        # Only normalize where norm > eps, otherwise use zero vector
+        g_norm = torch.where(gf_norm > eps, gf_vel / gf_norm, torch.zeros_like(gf_vel))
+        v_norm = torch.where(lv_norm > eps, lin_vel / lv_norm, torch.zeros_like(lin_vel))
 
         # Cosine similarity
         cos_align = torch.sum(g_norm * v_norm, dim=-1)  # (N, M)
